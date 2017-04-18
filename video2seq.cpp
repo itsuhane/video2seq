@@ -26,10 +26,10 @@ public:
         size_t count = (size_t)video.get(CAP_PROP_FRAME_COUNT);
         this->first = first;
         if (last < 0) {
-            this->last = count;
+            this->last = count-1;
         }
         else {
-            this->last = min((size_t)last, count);
+            this->last = min((size_t)last, count-1);
         }
         this->step = step;
         this->curr_index = this->next_index = this->first;
