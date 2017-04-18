@@ -2,14 +2,133 @@
 #include <boost\program_options.hpp>
 #include <opencv2\opencv.hpp>
 
-#define VERSION "1.00"
+#define VERSION "1.50"
 
 using namespace std;
 using namespace cv;
 using namespace boost::program_options;
 
 void banner() {
-    cout << "video2seq ver." VERSION " by ljy.swimming@qq.com." << endl << endl;
+    cout << "video2seq ver." VERSION " by ljy.swimming@qq.com." << endl;
+}
+
+class VideoSeeker {
+public:
+    bool open(const std::string &path) {
+        return video.open(path);
+    }
+
+    void set_mode(bool jump = false) {
+        this->jump = jump;
+    }
+
+    void set_range(size_t first, ptrdiff_t last, size_t step = 1) {
+        size_t count = (size_t)video.get(CAP_PROP_FRAME_COUNT);
+        this->first = first;
+        if (last < 0) {
+            this->last = count;
+        }
+        else {
+            this->last = min((size_t)last, count);
+        }
+        this->step = step;
+        this->curr_index = this->next_index = this->first;
+    }
+
+    bool has_next() const {
+        return next_index <= this->last;
+    }
+
+    size_t index() const {
+        return next_index;
+    }
+
+    Mat next() {
+        if (has_next()) {
+            Mat result;
+            if (jump) {
+                curr_index = next_index;
+                video.set(CAP_PROP_POS_FRAMES, (double)curr_index);
+                video >> result;
+            }
+            else {
+                while (curr_index <= next_index) {
+                    video >> result;
+                    curr_index++;
+                }
+            }
+            next_index += step;
+            return result;
+        }
+        else {
+            return Mat();
+        }
+    }
+
+    int width() {
+        return (int)video.get(CAP_PROP_FRAME_WIDTH);
+    }
+
+    int height() {
+        return (int)video.get(CAP_PROP_FRAME_HEIGHT);
+    }
+
+    size_t total() {
+        return last;
+    }
+private:
+    VideoCapture video;
+    bool jump = false;
+    size_t first = 0;
+    size_t last = size_t(-1);
+    size_t step = 1;
+    size_t curr_index = 0;
+    size_t next_index = 0;
+};
+
+enum RotateMode {
+    RM_NONE = 0,
+    RM_CW = 1,
+    RM_CCW = 2,
+    RM_X = 3,
+    RM_Y = 4,
+    RM_XY = 5,
+    RM_DIAG = 6,
+    RM_ANTI = 7
+};
+
+Mat transform_image(const Mat &mat, RotateMode rm) {
+    Mat result = mat;
+    switch (rm) {
+    default:
+    case RM_NONE:
+        break;
+    case RM_CW:
+        transpose(result, result);
+        flip(result, result, 1);
+        break;
+    case RM_CCW:
+        transpose(result, result);
+        flip(result, result, 0);
+        break;
+    case RM_X:
+        flip(result, result, 1);
+        break;
+    case RM_Y:
+        flip(result, result, 0);
+        break;
+    case RM_XY:
+        flip(result, result, -1);
+        break;
+    case RM_DIAG:
+        transpose(result, result);
+        break;
+    case RM_ANTI:
+        transpose(result, result);
+        flip(result, result, -1);
+        break;
+    }
+    return result;
 }
 
 /*
@@ -28,7 +147,6 @@ void banner() {
 */
 
 int main(int argc, char *argv[]) {
-
     string input_path;
     string output_pattern;
 
@@ -51,16 +169,7 @@ int main(int argc, char *argv[]) {
     bool do_undistort = false;
     bool show_help = false;
 
-    enum RotateMode {
-        RM_NONE = 0,
-        RM_CW = 1,
-        RM_CCW = 2,
-        RM_X = 3,
-        RM_Y = 4,
-        RM_XY = 5,
-        RM_DIAG = 6,
-        RM_ANTI = 7
-    } rotate_mode;
+    RotateMode rotate_mode;
 
     options_description desc("Allowed options");
     desc.add_options()
@@ -79,7 +188,7 @@ int main(int argc, char *argv[]) {
         ("mode", value<string>(&mode_string)->default_value("skip"), "frame searching mode for exporting, see notes")
         ("verbose,v", value<size_t>(&verbose)->default_value(2), "amount of information printed on screen, see notes")
         ("help,h", "show this message")
-    ;
+        ;
 
     variables_map vm;
     try {
@@ -106,7 +215,8 @@ int main(int argc, char *argv[]) {
     }
 
     // check parameters
-    VideoCapture video;
+    VideoSeeker video;
+    // VideoCapture video;
     if (!video.open(input_path)) {
         cout << "Error: cannot open \"" << input_path << "\"" << endl;
         exit(EXIT_FAILURE);
@@ -123,11 +233,14 @@ int main(int argc, char *argv[]) {
         cout << "Warning: input-end is smaller than input-start, no frame will be written." << endl;
         exit(EXIT_SUCCESS);
     }
+    video.set_range(input_start, input_end, input_step);
+
     if (downscale == 0) {
         cout << "Error: downscale ratio cannot be smaller than 1." << endl;
         exit(EXIT_FAILURE);
     }
 
+    transform(rotate_string.begin(), rotate_string.end(), rotate_string.begin(), tolower);
     if (rotate_string == "" || rotate_string == "none") {
         rotate_mode = RM_NONE;
     }
@@ -153,12 +266,18 @@ int main(int argc, char *argv[]) {
         rotate_mode = RM_ANTI;
     }
     else {
-        rotate_mode = RM_NONE;
+        cout << "Error: unknown transform \"" << rotate_string << "\"" << endl;
+        exit(EXIT_FAILURE);
     }
 
+    transform(mode_string.begin(), mode_string.end(), mode_string.begin(), tolower);
     if (mode_string != "skip" && mode_string != "jump") {
         cout << "Error: unknown mode \"" << mode_string << "\"" << endl;
         exit(EXIT_FAILURE);
+    }
+
+    if (mode_string == "jump") {
+        video.set_mode(true);
     }
 
     if ((vm.count("undistort") || intrinsic_out.size()>0) && intrinsic_in.size()==0) {
@@ -171,18 +290,15 @@ int main(int argc, char *argv[]) {
     }
 
     // get video information
-    int width = (int)video.get(CAP_PROP_FRAME_WIDTH);
-    int height = (int)video.get(CAP_PROP_FRAME_HEIGHT);
-    size_t count = (size_t)video.get(CAP_PROP_FRAME_COUNT);
-    size_t save_end = count;
-    if (input_end != -1) {
-        save_end = (size_t)input_end;
-    }
+    int width = video.width();
+    int height = video.height();
 
     int save_width = width / (int)downscale;
     int save_height = height / (int)downscale;
 
-    float fx = height, fy = height, cx = width*0.5, cy = height*0.5, k1 = 0, k2 = 0, p1 = 0, p2 = 0, k3 = 0, k4 = 0, k5 = 0, k6 = 0;
+    float fx = (float)height, fy = (float)height, cx = width*0.5f, cy = height*0.5f, k1 = 0, k2 = 0, p1 = 0, p2 = 0, k3 = 0, k4 = 0, k5 = 0, k6 = 0;
+
+    float fx_new = fx, fy_new = fy, cx_new = cx, cy_new = cy;
 
     if (intrinsic_in.size() > 0) {
         FILE *kin = fopen(intrinsic_in.c_str(), "r");
@@ -190,10 +306,70 @@ int main(int argc, char *argv[]) {
             fscanf(kin, "%f %f %f %f %f %f %f %f %f %f %f %f", &fx, &fy, &cx, &cy, &k1, &k2, &p1, &p2, &k3, &k4, &k5, &k6);
             fclose(kin);
 
+            switch (rotate_mode) {
+            default:
+            case RM_NONE:
+                fx_new = fx / downscale;
+                fy_new = fy / downscale;
+                cx_new = cx / downscale;
+                cy_new = cy / downscale;
+                //fprintf(kout, "%f %f %f %f", fx / downscale, fy / downscale, cx / downscale, cy / downscale);
+                break;
+            case RM_CW:  // fx <-> fy, cx <- h-cy, cy <- cx
+                fx_new = fy / downscale;
+                fy_new = fx / downscale;
+                cx_new = (height - cy) / downscale;
+                cy_new = cx / downscale;
+                //fprintf(kout, "%f %f %f %f", fy / downscale, fx / downscale, (height - cy) / downscale, cx / downscale);
+                break;
+            case RM_CCW: // fx <-> fy, cx <- cy, cy<- w-cx
+                fx_new = fy / downscale;
+                fy_new = fx / downscale;
+                cx_new = cy / downscale;
+                cy_new = (width - cx) / downscale;
+                //fprintf(kout, "%f %f %f %f", fy / downscale, fx / downscale, cy / downscale, (width - cx) / downscale);
+                break;
+            case RM_X: // cx <- w-cx
+                fx_new = fx / downscale;
+                fy_new = fy / downscale;
+                cx_new = (width-cx) / downscale;
+                cy_new = cy / downscale;
+                //fprintf(kout, "%f %f %f %f", fx / downscale, fy / downscale, (width - cx) / downscale, cy / downscale);
+                break;
+            case RM_Y: // cy <- h-cy
+                fx_new = fx / downscale;
+                fy_new = fy / downscale;
+                cx_new = cx / downscale;
+                cy_new = (height-cy) / downscale;
+                //fprintf(kout, "%f %f %f %f", fx / downscale, fy / downscale, cx / downscale, (height - cy) / downscale);
+                break;
+            case RM_XY:// cx <- w-cx, cy <- h-cy
+                fx_new = fx / downscale;
+                fy_new = fy / downscale;
+                cx_new = (width-cx) / downscale;
+                cy_new = (height-cy) / downscale;
+                //fprintf(kout, "%f %f %f %f", fx / downscale, fy / downscale, (width - cx) / downscale, (height - cy) / downscale);
+                break;
+            case RM_DIAG: // fx <-> fy, cx <-> cy
+                fx_new = fy / downscale;
+                fy_new = fx / downscale;
+                cx_new = cy / downscale;
+                cy_new = cx / downscale;
+                //fprintf(kout, "%f %f %f %f", fy / downscale, fx / downscale, cy / downscale, cx / downscale);
+                break;
+            case RM_ANTI: // fx <-> fy, cx <- h-cy, cy <- w-cx
+                fx_new = fy / downscale;
+                fy_new = fx / downscale;
+                cx_new = (height-cy) / downscale;
+                cy_new = (width-cx) / downscale;
+                //fprintf(kout, "%f %f %f %f", fy / downscale, fx / downscale, (height - cy) / downscale, (width - cx) / downscale);
+                break;
+            }
+
             if (intrinsic_out.size() > 0) {
                 FILE *kout = fopen(intrinsic_out.c_str(), "w");
                 if (kout) {
-                    fprintf(kout, "%f %f %f %f", fx / downscale, fy / downscale, cx / downscale, cy / downscale);
+                    fprintf(kout, "%f %f %f %f", fx_new, fy_new, cx_new, cy_new);
                     fclose(kout);
                 }
             }
@@ -204,15 +380,16 @@ int main(int argc, char *argv[]) {
         banner();
         cout << "Video size: " << width << "x" << height << endl;
         cout << "Output size: " << save_width << "x" << save_height << endl;
-        cout << "Frame number: " << count << endl << endl;
+        cout << "Last frame: " << video.total() << endl;
+        //cout << "Frame number: " << count << endl << endl;
         if (intrinsic_in.size() > 0) {
             cout << "Calibration data:" << endl;
             cout << "fx = " << fx << ", fy = " << fy << ", cx = " << cx << ", cy = " << cy << endl;
             cout << "k1 = " << k1 << ", k2 = " << k2 << ", p1 = " << p1 << ", p2 = " << p2 << ", k3 = " << k3 << ", k4 = " << k4 << ", k5 = " << k5 << ", k6 = " << k6 << endl << endl;
         }
         if (intrinsic_out.size() > 0) {
-            cout << "After downscale:" << endl;
-            cout << "fx = " << fx / downscale << ", fy = " << fy / downscale << ", cx = " << cx / downscale << ", cy = " << cy / downscale << endl << endl;
+            cout << "After transformation:" << endl;
+            cout << "fx = " << fx_new << ", fy = " << fy_new << ", cx = " << cx_new << ", cy = " << cy_new << endl << endl;
         }
     }
 
@@ -229,61 +406,31 @@ int main(int argc, char *argv[]) {
     Mat frame(width, height, CV_8UC3);
     Mat save_frame(save_width, save_height, CV_8UC3);
     char save_name[255];
-    if (mode_string == "skip") {
-        video.set(CAP_PROP_POS_FRAMES, (double)input_start);
-        size_t counter = output_start;
-        for (size_t i = input_start; i < count && i <= save_end; ++i) {
-            video >> tmpframe;
-            if ((i - input_start) % input_step == 0) {
-                if (do_undistort) {
-                    cv::undistort(tmpframe, frame, K, dist);
-                }
-                else {
-                    frame = tmpframe;
-                }
 
-                sprintf_s(save_name, output_pattern.c_str(), counter);
-                if (downscale > 1) {
-                    resize(frame, save_frame, Size(save_width, save_height));
-                    imwrite(save_name, save_frame);
-                }
-                else {
-                    imwrite(save_name, frame);
-                }
-                if (verbose >= 2) {
-                    cout << "\rCurrent frame: " << i;
-                }
-                counter += output_step;
-            }
+    size_t counter = output_start;
+    while (video.has_next()) {
+        size_t i = video.index();
+        tmpframe = video.next();
+        if (do_undistort) {
+            cv::undistort(tmpframe, frame, K, dist);
         }
-        cout << endl;
-    }
-    else {
-        size_t counter = output_start;
-        for (size_t i = input_start; i < count && i <= save_end; i += input_step) {
-            video.set(CAP_PROP_POS_FRAMES, (double)i);
-            video >> tmpframe;
-            if (do_undistort) {
-                cv::undistort(tmpframe, frame, K, dist);
-            }
-            else {
-                frame = tmpframe;
-            }
-            sprintf_s(save_name, output_pattern.c_str(), counter);
-            if (downscale > 1) {
-                resize(frame, save_frame, Size(save_width, save_height));
-                imwrite(save_name, save_frame);
-            }
-            else {
-                imwrite(save_name, frame);
-            }
-            if (verbose >= 2) {
-                cout << "\rCurrent frame: " << i;
-            }
-            counter += output_step;
+        else {
+            frame = tmpframe;
         }
-        cout << endl;
+        sprintf_s(save_name, output_pattern.c_str(), counter);
+        if (downscale > 1) {
+            resize(frame, save_frame, Size(save_width, save_height));
+            imwrite(save_name, transform_image(save_frame, rotate_mode));
+        }
+        else {
+            imwrite(save_name, transform_image(frame, rotate_mode));
+        }
+        if (verbose >= 2) {
+            cout << "\rCurrent frame: " << i;
+        }
+        counter += output_step;
     }
+    cout << endl;
 
     return 0;
 }
